@@ -1,0 +1,76 @@
+name: Simulate release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: simulate-release
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-west-2
+  RELEASE_TAG: sync-test-${{ github.run_number }}-${{ github.run_attempt }}
+
+jobs:
+  release:
+    name: Create and sync release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Create test artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+
+          for platform in linux-x86_64 linux-arm64 macos-arm64; do
+            mkdir -p "staging/${platform}"
+            printf '%s\n' \
+              "Dummy aws-lambda-cpp release artifact" \
+              "Platform: ${platform}" \
+              "Release: ${RELEASE_TAG}" \
+              "Commit: ${GITHUB_SHA}" \
+              > "staging/${platform}/README.txt"
+
+            (
+              cd "staging/${platform}"
+              zip -q "../../release-assets/aws-lambda-cpp-${platform}.zip" README.txt
+            )
+          done
+
+      - name: Create GitHub prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release create "${RELEASE_TAG}" release-assets/*.zip \
+            --repo "${GITHUB_REPOSITORY}" \
+            --target "${GITHUB_SHA}" \
+            --title "Sync test ${RELEASE_TAG}" \
+            --notes "Automated test release containing three dummy ZIP artifacts." \
+            --prerelease
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-actions-release-${{ github.run_id }}
+
+      - name: Sync release artifacts to S3
+        env:
+          S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+        run: |
+          set -euo pipefail
+          aws s3 sync release-assets/ \
+            "s3://${S3_BUCKET_NAME}/releases/${RELEASE_TAG}/" \
+            --no-progress
