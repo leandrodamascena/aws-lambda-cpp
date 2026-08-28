@@ -1,4 +1,4 @@
-name: Sync repository to S3
+name: Replicate repository
 
 on:
   workflow_dispatch:
@@ -8,15 +8,16 @@ permissions:
   id-token: write
 
 concurrency:
-  group: sync-repository-to-s3
+  group: repository-replication
   cancel-in-progress: false
 
 env:
   AWS_REGION: us-west-2
+  SOURCE_SNAPSHOT_KEY: aws-lambda-cpp.tgz
 
 jobs:
   sync:
-    name: Sync repository
+    name: Sync source snapshot
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -33,13 +34,55 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: github-actions-s3-sync-${{ github.run_id }}
 
-      - name: Sync repository to S3
+      - name: Create source snapshot
+        run: |
+          set -euo pipefail
+          tar \
+            --exclude=".git" \
+            -czf "/tmp/${SOURCE_SNAPSHOT_KEY}" \
+            -C "${GITHUB_WORKSPACE}" \
+            .
+
+      - name: Upload source snapshot to S3
         env:
           S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
         run: |
           set -euo pipefail
-          aws s3 sync . "s3://${S3_BUCKET_NAME}/" \
-            --delete \
-            --exclude ".git/*" \
-            --exclude "releases/*" \
-            --no-progress
+          aws s3 cp \
+            "/tmp/${SOURCE_SNAPSHOT_KEY}" \
+            "s3://${S3_BUCKET_NAME}/${SOURCE_SNAPSHOT_KEY}" \
+            --no-progress \
+            --only-show-errors
+
+      - name: Replicate source snapshot
+        env:
+          SYNC_FUNCTION_ARN: ${{ secrets.SYNC_FUNCTION_ARN }}
+          SYNC_REQUEST_CONFIG: ${{ secrets.SYNC_REQUEST_CONFIG }}
+        run: |
+          set -euo pipefail
+
+          jq -e \
+            --arg source_path "${SOURCE_SNAPSHOT_KEY}" \
+            --arg repository "${GITHUB_REPOSITORY}" \
+            --arg commit "${GITHUB_SHA}" \
+            '. + {
+              s3FilePath: $source_path,
+              gitHubRepo: $repository,
+              gitHubCommit: $commit,
+              extractArchive: true
+            }' <<< "${SYNC_REQUEST_CONFIG}" > /tmp/sync-request.json
+
+          function_error="$(aws lambda invoke \
+            --function-name "${SYNC_FUNCTION_ARN}" \
+            --cli-binary-format raw-in-base64-out \
+            --payload file:///tmp/sync-request.json \
+            --query FunctionError \
+            --output text \
+            /tmp/sync-response.json)"
+
+          if [[ "${function_error}" != "None" ]]; then
+            echo "Replication failed; inspect the function logs for details." >&2
+            exit 1
+          fi
+
+          echo "Source snapshot replicated successfully."

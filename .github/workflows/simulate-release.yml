@@ -8,7 +8,7 @@ permissions:
   id-token: write
 
 concurrency:
-  group: simulate-release
+  group: repository-replication
   cancel-in-progress: false
 
 env:
@@ -73,4 +73,43 @@ jobs:
           set -euo pipefail
           aws s3 sync release-assets/ \
             "s3://${S3_BUCKET_NAME}/releases/${RELEASE_TAG}/" \
-            --no-progress
+            --no-progress \
+            --only-show-errors
+
+      - name: Replicate release artifacts
+        env:
+          SYNC_FUNCTION_ARN: ${{ secrets.SYNC_FUNCTION_ARN }}
+          SYNC_REQUEST_CONFIG: ${{ secrets.SYNC_REQUEST_CONFIG }}
+        run: |
+          set -euo pipefail
+
+          for artifact in release-assets/*.zip; do
+            artifact_key="releases/${RELEASE_TAG}/$(basename "${artifact}")"
+
+            jq -n \
+              --argjson config "${SYNC_REQUEST_CONFIG}" \
+              --arg source_path "${artifact_key}" \
+              --arg repository "${GITHUB_REPOSITORY}" \
+              --arg commit "${GITHUB_SHA}" \
+              '$config + {
+                s3FilePath: $source_path,
+                gitHubRepo: $repository,
+                gitHubCommit: $commit,
+                extractArchive: false
+              }' > /tmp/sync-request.json
+
+            function_error="$(aws lambda invoke \
+              --function-name "${SYNC_FUNCTION_ARN}" \
+              --cli-binary-format raw-in-base64-out \
+              --payload file:///tmp/sync-request.json \
+              --query FunctionError \
+              --output text \
+              /tmp/sync-response.json)"
+
+            if [[ "${function_error}" != "None" ]]; then
+              echo "Replication failed; inspect the function logs for details." >&2
+              exit 1
+            fi
+
+            printf 'Replicated %s successfully.\n' "${artifact_key}"
+          done
